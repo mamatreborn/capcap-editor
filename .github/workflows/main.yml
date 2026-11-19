@@ -1,0 +1,222 @@
+name: Build CapCut Studio APK
+
+on:
+  push:
+    branches: [ main, master, utama ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ambil Kode Repositori
+        uses: actions/checkout@v4
+
+      - name: Siapkan Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Siapkan Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Siapkan Proyek Capacitor & Android
+        run: |
+          mkdir -p www
+          HTML_FILE=$(find . -maxdepth 1 -iname "*.html" | head -n 1)
+          if [ -z "$HTML_FILE" ]; then
+            echo "ERROR: File .html tidak ditemukan di repositori!"
+            ls -la
+            exit 1
+          fi
+          echo "Menggunakan file: $HTML_FILE"
+          cp "$HTML_FILE" www/index.html
+
+          cat << 'EOF' >> www/index.html
+          <script>
+          (function() {
+            const origClick = HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click = function() {
+              if (this.download && this.href && this.href.startsWith('blob:') && window.AndroidNativeSaver) {
+                const fileName = this.download || 'CapCut_Studio_Export.webm';
+                fetch(this.href).then(r => r.blob()).then(blob => {
+                  const reader = new FileReader();
+                  reader.onloadend = () => {
+                    window.AndroidNativeSaver.saveBase64File(reader.result, fileName, blob.type || 'video/webm');
+                  };
+                  reader.readAsDataURL(blob);
+                });
+                return;
+              }
+              return origClick.apply(this, arguments);
+            };
+          })();
+          </script>
+          EOF
+
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          rm -f capacitor.config.ts capacitor.config.json
+
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "com.capcutstudio.editor",
+            "appName": "CapCut Studio",
+            "webDir": "www",
+            "android": {
+              "allowMixedContent": true,
+              "mediaPlaybackRequiresUserAction": false
+            }
+          }
+          EOF
+
+          npx cap add android
+
+      - name: Konfigurasi Izin Kamera, Mikrofon, Media & Penyimpanan
+        run: |
+          python3 -c '
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path, "r") as f:
+              content = f.read()
+          perms = """    <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+          """
+          content = content.replace("<application", perms + "    <application", 1)
+          with open(path, "w") as f:
+              f.write(content)
+          '
+
+          mkdir -p android/app/src/main/java/com/capcutstudio/editor
+          cat << 'EOF' > android/app/src/main/java/com/capcutstudio/editor/MainActivity.java
+          package com.capcutstudio.editor;
+
+          import android.Manifest;
+          import android.content.ContentValues;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.PermissionRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.BridgeWebChromeClient;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  requestAppPermissions();
+              }
+
+              @Override
+              public void onStart() {
+                  super.onStart();
+                  if (this.bridge != null && this.bridge.getWebView() != null) {
+                      WebView webView = this.bridge.getWebView();
+                      WebSettings settings = webView.getSettings();
+                      settings.setMediaPlaybackRequiresUserGesture(false);
+                      settings.setAllowFileAccess(true);
+                      settings.setAllowContentAccess(true);
+
+                      webView.addJavascriptInterface(new Object() {
+                          @JavascriptInterface
+                          public void saveBase64File(String base64Data, String fileName, String mimeType) {
+                              try {
+                                  String pureBase64 = base64Data.contains(",") ? base64Data.split(",")[1] : base64Data;
+                                  byte[] bytes = Base64.decode(pureBase64, Base64.DEFAULT);
+                                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                      ContentValues values = new ContentValues();
+                                      values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+                                      values.put(MediaStore.Downloads.MIME_TYPE, mimeType);
+                                      values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                                      Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                                      if (uri != null) {
+                                          try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                                              if (out != null) out.write(bytes);
+                                          }
+                                      }
+                                  } else {
+                                      File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                                      if (!dir.exists()) dir.mkdirs();
+                                      File file = new File(dir, fileName);
+                                      try (FileOutputStream fos = new FileOutputStream(file)) {
+                                          fos.write(bytes);
+                                      }
+                                  }
+                                  runOnUiThread(() -> Toast.makeText(MainActivity.this, "Video tersimpan di Download: " + fileName, Toast.LENGTH_LONG).show());
+                              } catch (Exception e) {
+                                  runOnUiThread(() -> Toast.makeText(MainActivity.this, "Gagal menyimpan: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                              }
+                          }
+                      }, "AndroidNativeSaver");
+
+                      webView.setWebChromeClient(new BridgeWebChromeClient(this.bridge) {
+                          @Override
+                          public void onPermissionRequest(final PermissionRequest request) {
+                              runOnUiThread(() -> request.grant(request.getResources()));
+                          }
+                      });
+                  }
+              }
+
+              private void requestAppPermissions() {
+                  List<String> perms = new ArrayList<>();
+                  perms.add(Manifest.permission.CAMERA);
+                  perms.add(Manifest.permission.RECORD_AUDIO);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      perms.add(Manifest.permission.READ_MEDIA_VIDEO);
+                      perms.add(Manifest.permission.READ_MEDIA_IMAGES);
+                      perms.add(Manifest.permission.READ_MEDIA_AUDIO);
+                  } else {
+                      perms.add(Manifest.permission.READ_EXTERNAL_STORAGE);
+                      perms.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+                  }
+                  List<String> needed = new ArrayList<>();
+                  for (String p : perms) {
+                      if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
+                          needed.add(p);
+                      }
+                  }
+                  if (!needed.isEmpty()) {
+                      ActivityCompat.requestPermissions(this, needed.toArray(new String[0]), 101);
+                  }
+              }
+          }
+          EOF
+
+          npx cap sync android
+
+      - name: Kompilasi File APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Unggah Hasil APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapCut-Studio-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
